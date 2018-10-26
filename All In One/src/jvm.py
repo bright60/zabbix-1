@@ -2,6 +2,9 @@
 '''
 JVM Stat
 qjq@2017-01-19
+
+fixed the get the value of Vmname issue which can't get the correct result in the following command:
+python jvm.py -b "java.lang:type=Runtime" -k "VmName" -p 18080
 '''
 
 import sys
@@ -11,6 +14,7 @@ import platform
 
 import os
 import json
+import getpass
 
 from qiueer.python.slog import slog
 from qiueer.python.cmds import cmds
@@ -25,7 +29,7 @@ def get_realpath():
 def get_binname():
     return os.path.split(os.path.realpath(__file__))[1]
 
-class JTomcat(object):
+class JMX(object):
     def __init__(self, logpath, debug=False):
         self._logpath = logpath
         self._debug = debug
@@ -33,7 +37,7 @@ class JTomcat(object):
         self._cmdclient_jar = get_realpath() + "/" + "cmdline-jmxclient-0.10.3.jar"
         self._logger = slog(self._logpath, debug=debug, size=5, count=5)
 
-    def get_port_list(self):
+    def _get_jmx_port_list(self):
         cmdstr = "ps -ef | grep 'jmxremote.port='| grep -v grep 2>/dev/null"
         plst = []
         
@@ -64,25 +68,50 @@ class JTomcat(object):
             ln_ary = re.split("[\s]+", line)
             runuser=ln_ary[0]
             pid = ln_ary[1]
+            gcs = []
             jmxport = None
+            pattern=r'\-XX\:\+Use(\w+)GC'
             for field in ln_ary:
                 if "jmxremote.port=" in field:
                     jmxport = str(field).split("jmxremote.port=")[1]
+                    
+                m = re.match(pattern, field)
+                if m:
+                    gcs.append(m.group(1))
 
-            confitem = {
-                "{#PID}": int(pid),
-                "{#RUNUSER}": runuser,
-            }
-            
-            if jmxport:
-                confitem["{#JVMPORT}"] = int(jmxport)
-            
-            if confitem:
+            if not gcs:
+                confitem = {
+                    "{#PID}": int(pid),
+                    "{#RUNUSER}": runuser,
+                }
+                if jmxport:confitem["{#JVMPORT}"] = int(jmxport)
+                confitem["{#GC}"] = "Parallel"
                 data.append(confitem)
+            else:
+                for gc in gcs:
+                    confitem = {
+                        "{#PID}": int(pid),
+                        "{#RUNUSER}": runuser,
+                    }
+                    if jmxport:confitem["{#JVMPORT}"] = int(jmxport)
+                    confitem["{#GC}"] = gc or "Parallel"
+                    data.append(confitem)
+        return data
+
+    def get_port_list(self, GC=None):
+        data = self._get_jmx_port_list()
+        ## all jmx port
+        if GC == None:
+            return json.dumps({'data': data}, sort_keys=True, indent=7, separators=(",", ":"))
         
-        return json.dumps({'data': data}, sort_keys=True, indent=7, separators=(",", ":"))
+        ## jmx port for GC
+        gc_data = list()
+        for item in data:
+            if item["{#GC}"] == GC:
+                gc_data.append(item)
+        return json.dumps({'data': gc_data}, sort_keys=True, indent=7, separators=(",", ":"))
             
-    def get_item(self, beanstr, key, port):
+    def get_item(self, beanstr, key, port, iphost='localhost', auth='-'):
         """
         java -jar cmdline-jmxclient-0.10.3.jar - localhost:12345 java.lang:type=Memory NonHeapMemoryUsage
         参数：
@@ -93,9 +122,14 @@ class JTomcat(object):
             pos = str(key).rfind(".")
             pre_key = key[0:pos]
             sub_key = key[pos + 1:]
-        cmdstr = "%s -jar %s - localhost:%s '%s' '%s'" % (self._java_path, self._cmdclient_jar, port, beanstr, pre_key)
         
-        c2 = cmds(cmdstr, timeout=3)
+        if self._java_path == None:
+            print "can not find java command, exit."
+            return None
+        
+        cmdstr = "%s -jar %s %s %s:%s '%s' '%s'" % (self._java_path, self._cmdclient_jar, auth, iphost, port, beanstr, pre_key)
+        
+        c2 = cmds(cmdstr, timeout=6)
         stdo = c2.stdo()
         stde = c2.stde()
         retcode = c2.code()
@@ -118,17 +152,42 @@ class JTomcat(object):
 
         if stde_list:
             stdo_list.extend(stde_list)
-            
-        # # without sub attr
+    
+        # # without sub_key attr
+        #
+        # handle the output in below format:
+        # cmd: python jvm.py -b "java.lang:type=Runtime" -k "VmVersion" -p 18080
+        # output: 10/26/2015 14:23:51 +0800 org.archive.jmx.Client VmVersion: 25.121-b13
         if not sub_key and stdo_list:
             line = stdo_list[-1]
             ln_ary = re.split(" ", line)
             if ln_ary and len(ln_ary) >= 2:
                 if pre_key in ln_ary[-2]:
                     return ln_ary[-1]
+            # handle the out in below format:
+            # cmd: python jvm.py -d -b "java.lang:type=Runtime" -k "VmName" -p 18080 
+            # output: 10/26/2015 14:28:13 +0800 org.archive.jmx.Client VmName: Java HotSpot(TM) 64-Bit Server VM
+            for line in stdo_list:
+            	line = str(line).strip()
+            	ln_ary = re.split(":", line)            
+	        if ln_ary and len(ln_ary) > 2:
+               	   for key in ln_ary:
+		      if pre_key and pre_key in key:
+                         return str(ln_ary[-1]).strip()
             
-        # print stdo_list,"###"
-        # # with sub attr
+        #print stdo_list,"###"
+        #print "sub_key: " + sub_key
+        #print "-line: " + line
+        # handle the out in below format:
+        # cmd: python jvm.py -d -b "java.lang:type=Memory" -k "NonHeapMemoryUsage.used" -p 18080
+        # output:
+	    #stde: 10/26/2015 14:38:51 +0800 org.archive.jmx.Client NonHeapMemoryUsage: 
+	    #committed: 45842432
+        #init: 2555904
+        #max: -1
+        #used: 43731872
+
+        # # with sub_key attr
         for line in stdo_list:
             line = str(line).strip()
             ln_ary = re.split(":", line)
@@ -141,12 +200,20 @@ class JTomcat(object):
 
 def main():
     try:
-        usage = "usage: %prog [options]\ngGet Tomcat Stat"
+        usage = "usage: %prog [options]\nGet Java App Info By JMX Protocal"
         parser = OptionParser(usage)
         
         parser.add_option("-l", "--list",
                           action="store_true", dest="is_list", default=False,
-                          help="if list all port")
+                          help="list all localhost jmx_port")
+        
+        parser.add_option("-g",
+                          "--gc",
+                          action="store",
+                          dest="gc",
+                          type="string",
+                          default=None,
+                          help="such as: G1/ConcMarkSweep/Parallel/Serial")
         
         parser.add_option("-b",
                           "--beanstr",
@@ -163,6 +230,14 @@ def main():
                           type="string",
                           default='NonHeapMemoryUsage.max',
                           help="such as: NonHeapMemoryUsage")
+        
+        parser.add_option("-i",
+                          "--iphost",
+                          action="store",
+                          dest="iphost",
+                          type="string",
+                          default="localhost",
+                          help="iphost")
 
         parser.add_option("-p",
                           "--port",
@@ -170,7 +245,15 @@ def main():
                           dest="port",
                           type="int",
                           default=None,
-                          help="the port for tomcat")
+                          help="jmx port")
+        
+        parser.add_option("-a",
+                          "--auth",
+                          action="store",
+                          dest="auth",
+                          type="string",
+                          default='-',
+                          help="auth info, username:passowrd")
         
         parser.add_option("-d", "--debug",
                           action="store_true", dest="debug", default=False,
@@ -181,20 +264,27 @@ def main():
             parser.print_help()
             return
         
-        logpath = "/tmp/zabbix_jvm_info.log"
-        zbx_ex_obj = JTomcat(logpath, debug=options.debug)
+        logpath = "/tmp/zabbix_jvm_info_by_%s.log" % (getpass.getuser())
+        zbx_ex_obj = JMX(logpath, debug=options.debug)
         if options.is_list == True:
-            print zbx_ex_obj.get_port_list()
+            gc = options.gc
+            if gc in ["","None","Null"]:gc = None
+            print zbx_ex_obj.get_port_list(GC=gc)
             return
 
+        iphost = options.iphost
+        port = options.port
         beanstr = options.beanstr
         key = options.key
-        port = options.port
+        auth = options.auth
+        
         if beanstr and key and port:
-            res = zbx_ex_obj.get_item(beanstr, key, port)
+            res = zbx_ex_obj.get_item(beanstr, key, port, iphost=iphost, auth=auth)
             # # if have value
             if res:
                 print res
+        else:
+            parser.print_help()
 
     except Exception as expt:
         import traceback
